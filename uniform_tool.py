@@ -1994,6 +1994,11 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
  padding:12px 18px;border-top:1px solid var(--line)}
 .dlg-foot .msg{font-size:12px;color:var(--dim)}
 .dlg-foot .msg b{color:var(--txt)}
+#dlgSave{background:#1f7a4d;border:1px solid #35a86c;color:#eafff3;font-size:15px;font-weight:600;
+ padding:10px 26px;border-radius:9px;letter-spacing:.5px;box-shadow:0 2px 12px rgba(38,166,106,.35)}
+#dlgSave:hover{background:#26985c;border-color:#4dc487;box-shadow:0 3px 16px rgba(38,166,106,.5)}
+#dlgSave:disabled{background:#232a33;border-color:var(--line);color:var(--dim);
+ box-shadow:none;font-weight:400}
 #dlgFilter{width:100%;margin-bottom:14px}
 .pgroups{display:flex;flex-direction:column;gap:14px}
 .pgroup{border-top:1px solid var(--line);padding-top:10px}
