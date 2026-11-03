@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# 本地数据（角色池备份、预览图、评分、缓存、生成报告）一律不入库
+backups/
+exports/
+uniform_images/
+Uniform绑定总览.html
+mod_index_cache.json
+uniform_ratings.json
+*.bin
+*.log
