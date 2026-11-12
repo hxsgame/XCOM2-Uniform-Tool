@@ -54,6 +54,9 @@ STATUS_NAMES = {
     "EUS_ClassSpecific": "限定职业",
     "EUS_NonSoldier": "非士兵(敌人)",
 }
+# 页面下拉的排序（唯一来源，随目录下发给前端）
+STATUS_ORDER = ("EUS_NonSoldier", "EUS_AnyClass", "EUS_ClassSpecific",
+                "EUS_Manual", "EUS_NotUniform")
 STATUS_BY_ARG = {
     "notuniform": "EUS_NotUniform",
     "manual": "EUS_Manual",
@@ -213,7 +216,16 @@ def export_plan(pool_path, json_path=None, ini_path=None):
 
 KNOWN_TPL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "可编辑敌人模板_补全.txt")
-PRESETS = ("strict", "approx", "usable", "all")
+# 四档预设的唯一规则表：CLI、报告统计、页面筛选都从这里派生。
+#   need_known  只保留游戏内实测清单里的模板
+#   avail       允许的可用性三态（avail_any 的返回值：ok / unk / bad）
+PRESET_RULES = {
+    "strict": {"need_known": True},
+    "approx": {"avail": ("ok",)},
+    "usable": {"avail": ("ok", "unk")},
+    "all": {},
+}
+PRESETS = tuple(PRESET_RULES)
 PRESET_LABELS = {
     "strict": "按AM规则（严格）",
     "approx": "按AM规则（近似）",
@@ -222,11 +234,21 @@ PRESET_LABELS = {
 }
 
 _known_cache = None
+_known_warned = False
+
+
+def preset_pass(preset, known=False, avail="ok"):
+    """四档预设的唯一判定。"""
+    rule = PRESET_RULES[preset]
+    if rule.get("need_known") and not known:
+        return False
+    allowed = rule.get("avail")
+    return allowed is None or avail in allowed
 
 
 def load_known_templates(path=None):
     """读取游戏内实测清单：只取 `  - Name` 这种条目，忽略 ※ 说明行。"""
-    global _known_cache
+    global _known_cache, _known_warned
     if path is None and _known_cache is not None:
         return _known_cache
     known = set()
@@ -237,7 +259,10 @@ def load_known_templates(path=None):
                 if m:
                     known.add(m.group(1).lower())
     except Exception:
-        pass
+        if path is None and not _known_warned:
+            _known_warned = True
+            print("警告: 读不到实测模板清单 %s，「按AM规则（严格）」预设将为空。"
+                  % KNOWN_TPL_FILE, file=sys.stderr)
     if path is None:
         _known_cache = known
     return known
@@ -266,14 +291,17 @@ def tri_any(ent):
     return res[0][1] or res[1][1] or "不可用"
 
 
+BIND_CLASS_LIMITS = (2, 5)  # 与页面共用：0 灰、≤2 绿、≤5 蓝、更多 黄
+
+
 def bind_class(n):
-    """绑定次数配色：0 灰、1-2 绿、3-5 蓝、6+ 黄"""
+    """绑定次数配色，阈值见 BIND_CLASS_LIMITS。"""
     n = int(n or 0)
     if n <= 0:
         return "bc0"
-    if n <= 2:
+    if n <= BIND_CLASS_LIMITS[0]:
         return "bc1"
-    if n <= 5:
+    if n <= BIND_CLASS_LIMITS[1]:
         return "bc2"
     return "bc3"
 
@@ -976,7 +1004,7 @@ def template_bad_reason(ent):
     grp = str(f.get("group") or "").lower()
     if grp in ("speaker", "psizombie"):
         return "特殊单位组"
-    if STEM_SUFFIX_RE.sub("", ent["template"]).lower() in BASE_BAD_STEMS:
+    if STEM_SUFFIX_RE.sub("", ent.get("template") or "").lower() in BASE_BAD_STEMS:
         return "本体非人形单位"
     return None
 
@@ -1065,21 +1093,55 @@ def availability_reason(ent, gender=1):
     return from_archs()
 
 
-CACHE_VERSION = 12
+# 索引缓存结构：字段集合变了，缓存自动失效（不再靠人工递增版本号）
+INDEX_FIELDS = ("template", "display", "mods", "defined", "flags",
+                "mod_titles", "pawns", "archs", "bad")
+
+
+def index_signature():
+    """索引结构签名：由 INDEX_FIELDS 派生，改结构即换签名。"""
+    return hashlib.sha256("|".join(INDEX_FIELDS).encode("utf-8")).hexdigest()[:16]
+
+
+def _source_state(workshop_dir):
+    """workshop 目录指纹：子目录数 + 目录与各子目录的最新 mtime。"""
+    if not workshop_dir or not os.path.isdir(workshop_dir):
+        return None
+    try:
+        subs = [x for x in os.listdir(workshop_dir)
+                if os.path.isdir(os.path.join(workshop_dir, x))]
+    except OSError:
+        return None
+    stamps = []
+    for name in subs:
+        try:
+            stamps.append(os.path.getmtime(os.path.join(workshop_dir, name)))
+        except OSError:
+            pass
+    try:
+        stamps.append(os.path.getmtime(workshop_dir))
+    except OSError:
+        pass
+    return {"dir": os.path.abspath(workshop_dir), "count": len(subs),
+            "mtime": round(max(stamps), 3) if stamps else 0}
 
 
 def build_mod_index(workshop_dir, cache_path, refresh=False, verbose=False):
+    state = _source_state(workshop_dir)
     if not refresh and os.path.exists(cache_path):
         try:
-            import json
             with open(cache_path, encoding="utf-8") as f:
                 cached = json.load(f)
-            if isinstance(cached, dict) and cached.get("_version") == CACHE_VERSION \
+            if isinstance(cached, dict) \
+                    and cached.get("_version") == index_signature() \
+                    and cached.get("_source") == state \
                     and isinstance(cached.get("index"), dict):
                 return cached["index"]
+            if verbose:
+                print("模板索引缓存已过期（mod 目录有变动或结构升级），正在重建…",
+                      file=sys.stderr)
         except Exception:
             pass
-    import json
     index = {}
     proto = {}       # mid -> 该 mod 的模板原型标志（来自 CreateTemplate_xxx 里 new(string(...)) 的批量创建函数）
     newch_mods = {}  # 模板名(小写) -> {通过 newCharacters 定义它的 mid}
@@ -1280,8 +1342,8 @@ def build_mod_index(workshop_dir, cache_path, refresh=False, verbose=False):
             ent["bad"] = bad
     try:
         with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump({"_version": CACHE_VERSION, "index": index}, f,
-                      ensure_ascii=False, indent=1)
+            json.dump({"_version": index_signature(), "_source": state,
+                       "index": index}, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
     return index
@@ -1384,9 +1446,10 @@ EDITOR_HTML = """
   const selList=document.getElementById('selList');
   const msg=document.getElementById('dlgMsg');
   const saveBtn=document.getElementById('dlgSave');
-  const ST={EUS_NotUniform:'非Uniform',EUS_Manual:'手动',EUS_AnyClass:'全职业',
-            EUS_ClassSpecific:'限定职业',EUS_NonSoldier:'非士兵(敌人)'};
-  const ST_ORDER=['非士兵(敌人)','全职业','限定职业','手动','非Uniform'];
+  // 状态元数据、四档预设规则、配色阈值都由 Python 下发，前端不再手写副本
+  const ST={}, ST_ORDER=(CAT.st||[]).map(x=>{ ST[x.k]=x.d; return x.d; });
+  const BCT=CAT.bc||[2,5];
+  const PR=CAT.pr||{};
   const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   let mode='uniform', curIdx=-1, curTpl='', status='', bindMap={};
   let chosen=[], chosenLow=new Set(), chosenU=new Set();
@@ -1413,18 +1476,18 @@ EDITOR_HTML = """
     if(r.charAt(0)==='?') return {bad:false,unk:true,why:r.slice(1)};
     return {bad:true,unk:false,why:r};
   }
-  // 四档预设与页面（敌人模板表）共用同一口径
+  // 四档预设：规则来自 Python 的 PRESET_RULES（CAT.pr），这里只做判定
   function passPreset(o){
     if(mode!=='uniform'||!o) return true;
-    if(preset==='strict') return !!o.g;
+    const r=PR[preset]||{};
+    if(r.need_known&&!o.g) return false;
+    if(!r.avail) return true;
     const av=availOf(o);
-    if(preset==='approx') return !av.bad && !av.unk;
-    if(preset==='usable') return !av.bad;
-    return true;
+    return r.avail.indexOf(av.bad?'bad':(av.unk?'unk':'ok'))>=0;
   }
   function bcCls(n){
     n=+(n||0);
-    return n<=0?'bc0':(n<=2?'bc1':(n<=5?'bc2':'bc3'));
+    return n<=0?'bc0':(n<=BCT[0]?'bc1':(n<=BCT[1]?'bc2':'bc3'));
   }
   function pill(o){
     const on=isOn(o), av=availOf(o);
@@ -1804,7 +1867,7 @@ def render_report(pool_path, index, live=False, gender="both"):
             act))
 
     rows = []
-    p_counts = {"strict": 0, "approx": 0, "usable": 0, "all": 0}
+    p_counts = {p: 0 for p in PRESETS}
     all_keys = set(by_tpl)
     for k, ent in index.items():
         if ent.get("defined"):
@@ -1830,13 +1893,9 @@ def render_report(pool_path, index, live=False, gender="both"):
             uni = '<span class="bc bc0">×0</span>未绑定'
         strict = 1 if t.lower() in known_tpls else 0
         a3 = avail_any(ent, gender)
-        p_counts["all"] += 1
-        if strict:
-            p_counts["strict"] += 1
-        if a3 == "ok":
-            p_counts["approx"] += 1
-        if a3 != "bad":
-            p_counts["usable"] += 1
+        for p in PRESETS:
+            if preset_pass(p, known=bool(strict), avail=a3):
+                p_counts[p] += 1
         rows.append('<tr data-search="%s" data-tpl="%s" data-bound="%s" data-strict="%s"'
                     ' data-avail="%s"><td class=mono>%s</td>'
                     '<td>%s</td><td>%s</td><td class="avail">%s</td><td>%s</td>%s</tr>' % (
@@ -1854,19 +1913,15 @@ def render_report(pool_path, index, live=False, gender="both"):
         tpls = []
         known = set()
         # 各性别口径下的四档计数，由 Python 统一算出，前端只负责显示
-        pc = {m: {"strict": 0, "approx": 0, "usable": 0, "all": 0} for m in (0, 1, 2)}
+        pc = {m: {p: 0 for p in PRESETS} for m in (0, 1, 2)}
 
         def count_tpl(ent, k):
+            known = k in known_tpls
             for m, g in ((0, "both"), (1, "male"), (2, "female")):
-                c = pc[m]
-                c["all"] += 1
-                if k in known_tpls:
-                    c["strict"] += 1
                 a3 = avail_any(ent, g)
-                if a3 == "ok":
-                    c["approx"] += 1
-                if a3 != "bad":
-                    c["usable"] += 1
+                for p in PRESETS:
+                    if preset_pass(p, known=known, avail=a3):
+                        pc[m][p] += 1
 
         for ent in index.values():
             if not ent.get("defined"):
@@ -1895,8 +1950,14 @@ def render_report(pool_path, index, live=False, gender="both"):
                  "s": u["status"], "r": ratings.get(str(u["object_id"]), 0),
                  "img": img_url(u["object_id"], bust=True),
                  "c": len(u["templates"])} for u in us]
-        catalog = json.dumps({"tpl": tpls, "uni": unis, "pc": pc},
-                             ensure_ascii=False).replace("</", "<\\/")
+        catalog = json.dumps({
+            "tpl": tpls, "uni": unis, "pc": pc,
+            # 下拉/排序/配色/预设规则都随数据下发，前端不再手写
+            "st": [{"k": k, "d": STATUS_NAMES[k], "o": i}
+                   for i, k in enumerate(STATUS_ORDER)],
+            "bc": list(BIND_CLASS_LIMITS),
+            "pr": PRESET_RULES,
+        }, ensure_ascii=False).replace("</", "<\\/")
 
     n_tpl = len(by_tpl)
     n_total = len(all_keys)
@@ -2105,16 +2166,18 @@ th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--bg);f
   <tbody id="tbody">{{ROWS}}</tbody></table>
 </section>
 <script>
+const PR={{PRESET_JSON}};
 const q=document.getElementById('q');
 const tplPresetEl=document.getElementById('tplPreset');
 const list=[...document.querySelectorAll('#list .row')];
 const rows=[...document.querySelectorAll('#tbody tr')];
 let tplPreset='strict';
+// 四档预设：与 CLI / 弹窗共用 Python 的 PRESET_RULES
 function passPreset(r){
- if(tplPreset==='all') return true;
- if(tplPreset==='strict') return r.dataset.strict==='1';
- if(tplPreset==='approx') return r.dataset.avail==='ok';
- return r.dataset.avail!=='bad';   // usable：含未确认，排除不可用
+ const rule=PR[tplPreset]||{};
+ if(rule.need_known&&r.dataset.strict!=='1') return false;
+ if(!rule.avail) return true;
+ return rule.avail.indexOf(r.dataset.avail)>=0;
 }
 function applyFilter(){
  const v=q.value.trim().toLowerCase();
@@ -2236,6 +2299,7 @@ document.querySelectorAll('.rate[data-oid]').forEach(box=>{
             .replace("{{TH_ACT}}", '<th style="width:8%">操作</th>' if live else "")
             .replace("{{EDIT_BLOCK}}", EDITOR_HTML if live else "")
             .replace("{{CATALOG}}", catalog)
+            .replace("{{PRESET_JSON}}", json.dumps(PRESET_RULES))
             .replace("{{MODE}}", "实时模式 · 每次刷新页面都会重新读取角色池" if live
                      else "静态快照 · 数据不会自动变化")
             .replace("{{RELOAD_TIP}}", "重新读取 DefaultCharacterPool.bin" if live
@@ -2258,13 +2322,49 @@ def build_report(pool_path, out_path, index, gender="both"):
 # ----------------------------------------------------------------------------
 
 
-def serve(pool_path, index, port=8765, open_browser=True, gender="both"):
+def serve(pool_path, index, port=8765, open_browser=True, gender="both",
+          workshop_dir=None, cache_path=None):
     import threading
+    import time
     import traceback
     import webbrowser
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     lock = threading.Lock()
+
+    # 索引热更新：打开页面时比一次 mod 目录指纹，变了就在后台重建（重建约 9 秒，
+    # 不能放进请求线程），本次先用旧索引渲染并提示稍后刷新。
+    idx = {"data": index, "src": _source_state(workshop_dir),
+           "building": False, "last_try": 0.0}
+    toast = ('<div style="position:fixed;left:50%;bottom:24px;'
+             'transform:translateX(-50%);z-index:9999;background:#2a1f10;'
+             'color:#e6b355;border:1px solid #6b4f1d;padding:10px 16px;'
+             'border-radius:8px;font:13px system-ui;box-shadow:0 6px 20px #0008">'
+             '检测到 mod 目录有变动，正在后台重建模板索引，约 10 秒后刷新本页</div>')
+
+    def ensure_index():
+        """目录指纹变化时启动一次后台重建，返回 True 表示正在重建。"""
+        if not workshop_dir or idx["building"]:
+            return idx["building"]
+        cur = _source_state(workshop_dir)
+        if cur == idx["src"] or time.time() - idx["last_try"] < 30:
+            return False
+        idx["building"] = True
+        idx["last_try"] = time.time()
+
+        def work():
+            try:
+                idx["data"] = build_mod_index(workshop_dir, cache_path, verbose=True)
+                idx["src"] = _source_state(workshop_dir)
+                print("模板索引已重建：%d 条（刷新页面生效）" % len(idx["data"]))
+            except Exception as e:
+                print("模板索引重建失败: %s: %s" % (type(e).__name__, e),
+                      file=sys.stderr)
+            finally:
+                idx["building"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype="text/html; charset=utf-8"):
@@ -2298,7 +2398,10 @@ def serve(pool_path, index, port=8765, open_browser=True, gender="both"):
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             try:
-                html = render_report(pool_path, index, live=True, gender=gender)
+                rebuilding = ensure_index()
+                html = render_report(pool_path, idx["data"], live=True, gender=gender)
+                if rebuilding:
+                    html = html.replace("</body>", toast + "</body>", 1)
                 self._send(200, html.encode("utf-8"))
             except Exception:
                 err = traceback.format_exc().replace("<", "&lt;")
@@ -2416,7 +2519,8 @@ def serve(pool_path, index, port=8765, open_browser=True, gender="both"):
     except OSError as e:
         raise SystemExit("端口 %d 被占用（%s）。换一个: --port 8766" % (port, e))
     print("本地预览已启动: %s" % url)
-    print("每次刷新页面都会重新读取角色池；Ctrl+C 停止。")
+    print("每次刷新页面都会重新读取角色池；mod 目录有变动会在后台自动重建索引。")
+    print("Ctrl+C 停止。")
     if open_browser:
         webbrowser.open(url)
     try:
@@ -2440,13 +2544,13 @@ def find_uniform(pool, spec):
         hits = [u for u in us if u["object_id"] == oid]
         if hits:
             return hits[0]
-        raise SystemExit("没有 ObjectID 为 %d 的 Uniform" % oid)
+        raise ValueError("没有 ObjectID 为 %d 的 Uniform" % oid)
     exact = [u for u in us
              if spec_l in (display_name(u).lower(), (u["last"] or "").lower())]
     if len(exact) == 1:
         return exact[0]
     if exact:
-        raise SystemExit("有 %d 个 Uniform 都叫 %r，请改用 #ObjectID 指定：\n%s" % (
+        raise ValueError("有 %d 个 Uniform 都叫 %r，请改用 #ObjectID 指定：\n%s" % (
             len(exact), spec,
             "\n".join("  #%s  %s (%s)" % (u["object_id"], display_name(u),
                                          u["last"] or "") for u in exact)))
@@ -2454,7 +2558,7 @@ def find_uniform(pool, spec):
             or spec_l in (u["last"] or "").lower()]
     if len(hits) == 1:
         return hits[0]
-    raise SystemExit("找不到唯一的 Uniform: %r%s" % (
+    raise ValueError("找不到唯一的 Uniform: %r%s" % (
         spec, ("（候选: %s）" % "、".join("#%s %s" % (h["object_id"], display_name(h))
                                        for h in hits)) if hits else ""))
 
@@ -2468,18 +2572,18 @@ def element_name(d):
 
 
 # >>> WRITE-CORE B
-def _plan_templates(pool, idx, new, allow_status_change=False, status=None):
-    """算出某条目的改动字节，返回 (edits, 旧列表, 旧状态, 新状态)。"""
+def _plan_templates(pool, idx, new, status=None):
+    """算出某条目的改动字节，只描述「要改什么」，不做允许性判定。
+
+    返回 edits / old / old_status / new_status / templates / zero_allowed /
+    needs_status_change（新模板非空、且状态需要从非 NonSoldier 自动改成 NonSoldier）。
+    """
     d = pool.element_dict(pool.elems[idx])
     old = list(d.get("NonSoldierUniformTemplates") or [])
     cur_status = d.get("UniformStatus") or "EUS_NotUniform"
 
-    new_status = status or cur_status
-    if not status and new and cur_status != "EUS_NonSoldier":
-        if not allow_status_change:
-            raise ValueError("该 Uniform 当前状态是 %s，改成敌人绑定需要同时把状态设为 NonSoldier"
-                             % STATUS_NAMES.get(cur_status, cur_status))
-        new_status = "EUS_NonSoldier"
+    needs = bool(new) and not status and cur_status != "EUS_NonSoldier"
+    new_status = status or ("EUS_NonSoldier" if needs else cur_status)
 
     edits = {}
     if new != old or d.get("NonSoldierUniformTemplates") is None:
@@ -2487,7 +2591,45 @@ def _plan_templates(pool, idx, new, allow_status_change=False, status=None):
             "NonSoldierUniformTemplates", new)
     if new_status != cur_status:
         edits["UniformStatus"] = build_byte_tag("UniformStatus", "EUniformStatus", new_status)
-    return edits, old, cur_status, new_status
+    return {
+        "edits": edits, "old": old, "old_status": cur_status,
+        "new_status": new_status, "templates": new,
+        "needs_status_change": needs,
+        # AM 存盘时会把 Uniform 的 bAllowedType* 全部置 false，保持一致
+        "zero_allowed": new_status != "EUS_NotUniform",
+    }
+
+
+def _commit(pool, plans):
+    """把一批已规划的改动一次写盘（apply → verify → write），返回备份路径或 None。
+
+    只处理 edits 非空的条目；no_allowed 由 zero_allowed 统一推导。
+    """
+    todo = [x for x in plans if x["edits"]]
+    if not todo:
+        return None
+    element_edits, expected, zero = {}, {}, []
+    for plan in todo:
+        idx = plan["idx"]
+        element_edits[idx] = plan["edits"]
+        expected[idx] = {"templates": plan["templates"],
+                         "status": plan["new_status"]}
+        if plan["zero_allowed"]:
+            zero.append(idx)
+            expected[idx]["no_allowed"] = True
+    new_data = apply_edits(pool, element_edits, zero_allowed=tuple(zero))
+    verify(pool, new_data, expected)
+    return write_pool(pool, new_data, expected)
+
+
+def _dedupe(names):
+    out, seen = [], set()
+    for t in names:
+        t = str(t).strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
 
 
 def set_element_templates(pool_path, idx, templates, allow_status_change=False, status=None):
@@ -2496,40 +2638,29 @@ def set_element_templates(pool_path, idx, templates, allow_status_change=False, 
     if not (0 <= idx < p.count):
         raise ValueError("下标越界: %d（共 %d 条）" % (idx, p.count))
 
-    new = []
-    seen = set()
-    for t in templates:
-        t = str(t).strip()
-        if t and t.lower() not in seen:
-            seen.add(t.lower())
-            new.append(t)
+    new = _dedupe(templates)
+    plan = _plan_templates(p, idx, new, status=status)
+    if plan["needs_status_change"] and not allow_status_change:
+        cur = plan["old_status"]
+        raise ValueError("该 Uniform 当前状态是 %s，改成敌人绑定需要同时把状态设为 NonSoldier"
+                         % STATUS_NAMES.get(cur, cur))
 
-    edits, old, cur_status, new_status = _plan_templates(
-        p, idx, new, allow_status_change=allow_status_change, status=status)
-
+    old = plan["old"]
     old_set = {x.lower() for x in old}
     new_set = {x.lower() for x in new}
     result = {
         "ok": True, "index": idx,
         "old": old, "new": new,
-        "old_status": cur_status, "new_status": new_status,
+        "old_status": plan["old_status"], "new_status": plan["new_status"],
         "added": [x for x in new if x.lower() not in old_set],
         "removed": [x for x in old if x.lower() not in new_set],
         "changed": False, "backup": None,
     }
-    if not edits:
-        return result
-
-    expected = {idx: {"templates": new, "status": new_status}}
-    zero = ()
-    if new_status != "EUS_NotUniform":
-        # AM 存盘时会把 Uniform 的 bAllowedType* 全部置 false，保持一致
-        zero = (idx,)
-        expected[idx]["no_allowed"] = True
-    new_data = apply_edits(p, {idx: edits}, zero_allowed=zero)
-    verify(p, new_data, expected)
-    result["backup"] = write_pool(p, new_data, expected)
-    result["changed"] = True
+    plan["idx"] = idx
+    bak = _commit(p, [plan])
+    if bak:
+        result["backup"] = bak
+        result["changed"] = True
     return result
 
 
@@ -2546,52 +2677,44 @@ def set_uniforms_for_template(pool_path, template, indices, allow_status_change=
         if not (0 <= idx < p.count):
             raise ValueError("下标越界: %d（共 %d 条）" % (idx, p.count))
         d = p.element_dict(p.elems[idx])
-        name = element_name(d)
         old = list(d.get("NonSoldierUniformTemplates") or [])
         has = template.lower() in {x.lower() for x in old}
         new = [x for x in old if x.lower() != template.lower()] if has else old + [template]
-        edits, _, cur_status, new_status = _plan_templates(p, idx, new, allow_status_change=True)
-        if new_status != cur_status:
-            blocked.append(name)
-        plans.append((idx, name, edits, old, new, cur_status, new_status))
+        plan = _plan_templates(p, idx, new)
+        plan["idx"] = idx
+        plan["name"] = element_name(d)
+        if plan["needs_status_change"]:
+            blocked.append(plan["name"])
+        plans.append(plan)
 
     if blocked and not allow_status_change:
         raise ValueError("%d 个 Uniform 需要改成 NonSoldier 才能生效（%s%s）"
                          % (len(blocked), "、".join(blocked[:5]),
                             " 等" if len(blocked) > 5 else ""))
 
-    expected = {idx: {"templates": new, "status": ns}
-                for idx, _, edits, _, new, _, ns in plans if edits}
-    # AM 存盘时会把 Uniform 的 bAllowedType* 全部置 false，保持一致
-    zero = tuple(idx for idx, _, edits, _, new, _, ns in plans
-                 if edits and ns != "EUS_NotUniform")
-    for idx in zero:
-        expected[idx]["no_allowed"] = True
     result = {
         "ok": True, "template": template, "changed": False, "backup": None,
         "updated": [], "status_changed": [],
     }
-    for idx, name, edits, old, new, cur_status, new_status in plans:
-        old_set = {x.lower() for x in old}
-        new_set = {x.lower() for x in new}
-        if edits:
+    for plan in plans:
+        old_set = {x.lower() for x in plan["old"]}
+        new_set = {x.lower() for x in plan["templates"]}
+        if plan["edits"]:
             result["updated"].append({
-                "index": idx, "name": name,
-                "added": [x for x in new if x.lower() not in old_set],
-                "removed": [x for x in old if x.lower() not in new_set],
+                "index": plan["idx"], "name": plan["name"],
+                "added": [x for x in plan["templates"] if x.lower() not in old_set],
+                "removed": [x for x in plan["old"] if x.lower() not in new_set],
             })
-        if new_status != cur_status:
+        if plan["new_status"] != plan["old_status"]:
             result["status_changed"].append({
-                "index": idx, "name": name, "old": cur_status, "new": new_status,
+                "index": plan["idx"], "name": plan["name"],
+                "old": plan["old_status"], "new": plan["new_status"],
             })
 
-    if not expected:
-        return result
-
-    new_data = apply_edits(p, {x[0]: x[2] for x in plans if x[2]}, zero_allowed=zero)
-    verify(p, new_data, expected)
-    result["backup"] = write_pool(p, new_data, expected)
-    result["changed"] = True
+    bak = _commit(p, plans)
+    if bak:
+        result["backup"] = bak
+        result["changed"] = True
     return result
 # <<< WRITE-CORE B
 
@@ -2603,18 +2726,17 @@ def do_bind(pool_path, spec, templates, remove=False, status=None, set_status=Fa
     old = list(d.get("NonSoldierUniformTemplates") or [])
 
     if remove:
-        new = [x for x in old if x.lower() not in {t.lower() for t in templates}]
+        drop = {t.lower() for t in templates}
+        new = [x for x in old if x.lower() not in drop]
     else:
-        new = list(old)
-        for t in templates:
-            if t.lower() not in {x.lower() for x in new}:
-                new.append(t)
+        # 去重由 set_element_templates 统一负责
+        new = old + list(templates)
 
     try:
         res = set_element_templates(pool_path, u["index"], new,
                                     allow_status_change=set_status, status=status)
     except ValueError as e:
-        raise SystemExit(str(e) + "\n（如果确认要把该 Uniform 改成非士兵，加 --set-status）")
+        raise ValueError(str(e) + "\n（如果确认要把该 Uniform 改成非士兵，加 --set-status）")
 
     print("Uniform: %s  (#%s)" % (display_name(u), u["object_id"]))
     print("  状态: %s -> %s" % (STATUS_NAMES.get(res["old_status"], res["old_status"]),
@@ -2680,10 +2802,10 @@ def cmd_selftest(pool_path):
     old_t = list(d.get("NonSoldierUniformTemplates") or [])
     added = "ZZ_UniformToolSelftest"
     new_t = old_t if added.lower() in {x.lower() for x in old_t} else old_t + [added]
-    edits, _, cur_status, new_status = _plan_templates(
-        p, picked, new_t, allow_status_change=True, status="EUS_NonSoldier")
+    plan = _plan_templates(p, picked, new_t, status="EUS_NonSoldier")
+    cur_status, new_status = plan["old_status"], plan["new_status"]
     expected = {picked: {"templates": new_t, "status": new_status, "no_allowed": True}}
-    new_data = apply_edits(p, {picked: edits}, zero_allowed=(picked,))
+    new_data = apply_edits(p, {picked: plan["edits"]}, zero_allowed=(picked,))
     p2 = verify(p, new_data, expected)
     got = p2.element_dict(p2.elems[picked]).get("NonSoldierUniformTemplates") or []
     if added.lower() not in {x.lower() for x in got}:
@@ -2698,6 +2820,14 @@ def cmd_selftest(pool_path):
 
 
 def main():
+    """CLI 入口：用户输入错误统一是 ValueError，这里转成退出信息。"""
+    try:
+        _run()
+    except ValueError as e:
+        raise SystemExit(str(e))
+
+
+def _run():
     ap = argparse.ArgumentParser(
         description="XCOM2 Uniform Management 绑定离线工具（读写 DefaultCharacterPool.bin）")
     ap.add_argument("cmd", choices=["list", "report", "serve", "bind", "unbind", "status",
@@ -2758,7 +2888,7 @@ def main():
 
     if args.cmd == "serve":
         serve(pool_path, index, port=args.port, open_browser=not args.no_open,
-              gender=args.gender)
+              gender=args.gender, workshop_dir=workshop, cache_path=cache)
         return
 
     if args.cmd == "report":
@@ -2779,16 +2909,10 @@ def main():
         for k, ent in index.items():
             name = ent["template"]
             disp = ent.get("display") or pretty_template(name)
-            if args.preset and args.preset != "all":
-                if args.preset == "strict":
-                    if name.lower() not in known_tpls:
-                        continue
-                else:
-                    a3 = avail_any(ent, args.gender)
-                    if args.preset == "approx" and a3 != "ok":
-                        continue
-                    if args.preset == "usable" and a3 == "bad":
-                        continue
+            if args.preset and not preset_pass(
+                    args.preset, known=name.lower() in known_tpls,
+                    avail=avail_any(ent, args.gender)):
+                continue
             if q and q not in name.lower() and q not in disp.lower() \
                     and q not in (source_label(index, name) or "").lower():
                 continue
@@ -2803,17 +2927,17 @@ def main():
 
     if args.cmd == "status":
         if not args.value:
-            raise SystemExit("status 需要 --value NotUniform|Manual|AnyClass|ClassSpecific|NonSoldier")
+            raise ValueError("status 需要 --value NotUniform|Manual|AnyClass|ClassSpecific|NonSoldier")
         val = STATUS_BY_ARG.get(args.value.lower().replace("_", "").replace("eus", ""))
         if not val:
-            raise SystemExit("未知状态: %s" % args.value)
+            raise ValueError("未知状态: %s" % args.value)
         do_bind(pool_path, args.uniform, [], status=val)
         return
 
     if not args.uniform:
-        raise SystemExit("%s 需要 --uniform" % args.cmd)
+        raise ValueError("%s 需要 --uniform" % args.cmd)
     if not args.template:
-        raise SystemExit("%s 需要至少一个 --template" % args.cmd)
+        raise ValueError("%s 需要至少一个 --template" % args.cmd)
     do_bind(pool_path, args.uniform, args.template, remove=(args.cmd == "unbind"),
             set_status=args.set_status)
 
