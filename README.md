@@ -18,7 +18,7 @@ XCOM 2: War of the Chosen 的离线工具：直接读写角色池 `DefaultCharac
 ```bash
 python uniform_tool.py list                    # 列出 Uniform 及绑定的模板
 python uniform_tool.py report --out 总览.html  # 生成静态 HTML 总览
-python uniform_tool.py serve                   # 本地实时编辑页（默认 8765 端口）
+python uniform_tool.py serve                   # 本地实时编辑页（默认 8771 端口）
 python uniform_tool.py bind   --uniform 机械忍者-黑 --template CerberusNemesisM2
 python uniform_tool.py unbind --uniform 机械忍者-黑 --template CerberusNemesisM2
 python uniform_tool.py status --uniform 机械忍者-黑 --value NonSoldier

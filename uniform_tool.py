@@ -2322,7 +2322,7 @@ def build_report(pool_path, out_path, index, gender="both"):
 # ----------------------------------------------------------------------------
 
 
-def serve(pool_path, index, port=8765, open_browser=True, gender="both",
+def serve(pool_path, index, port=8771, open_browser=True, gender="both",
           workshop_dir=None, cache_path=None):
     import threading
     import time
@@ -2843,7 +2843,7 @@ def _run():
     ap.add_argument("--search", default=None, help="templates 命令的搜索词")
     ap.add_argument("--preset", choices=list(PRESETS), default=None,
                     help="templates 命令的筛选预设，与页面四处按钮同一口径")
-    ap.add_argument("--port", type=int, default=8765, help="serve 端口，默认 8765")
+    ap.add_argument("--port", type=int, default=8771, help="serve 端口，默认 8771")
     ap.add_argument("--no-open", action="store_true", help="serve 时不自动打开浏览器")
     ap.add_argument("--gender", choices=["both", "male", "female"], default="both",
                     help="report/serve 里按哪个性别计算并展示可用性，默认 both（男女各算一遍）")
